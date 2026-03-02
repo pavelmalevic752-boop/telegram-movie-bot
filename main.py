@@ -1,199 +1,183 @@
-import asyncio
 import logging
+import asyncio
+import sys
 import os
 import random
 import sqlite3
+import requests
 from datetime import datetime
 
-import aiohttp
-from aiohttp import web  # Добавили для веб-сервера
-from aiogram import Bot, Dispatcher
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
-
-# --- КОНФИГУРАЦИЯ ---
-load_dotenv()
-
-# Получаем переменные окружения
-API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-CHANNEL_ID = "@kinoshiza_channel"
-
-# --- ВАЖНО: ПРОВЕРКА ТОКЕНА ---
-# Если ключа нет, бот сразу скажет об этом в логах, а не упадет молча
-if not API_TOKEN:
-    print("ОШИБКА: Не найден TELEGRAM_BOT_TOKEN в переменных окружения!")
-    # Для теста локально можно раскомментировать и вставить токен вручную, но лучше через ENV
-    # API_TOKEN = "ВАШ_ТОКЕН_СЮДА"
-
-# Настройки
+# Настройка логов
 logging.basicConfig(level=logging.INFO)
-# Инициализируем объекты только если токен есть
-bot = Bot(token=API_TOKEN) if API_TOKEN else None
-dp = Dispatcher()
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-scheduler = AsyncIOScheduler()
 
-# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
-async def health_check(request):
-    """Просто отвечает Render'у, что бот жив."""
-    return web.Response(text="Bot is running! Киношиза на связи.")
+try:
+    from aiogram import Bot, Dispatcher
+    from aiogram.types import FSInputFile
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    # Библиотека Гугла
+    import google.generativeai as genai
+except ImportError:
+    print("❌ ОШИБКА: Зайди в Pip и установи: google-generativeai aiogram apscheduler requests")
+    sys.exit()
 
-async def start_web_server():
-    """Запускает веб-сервер на порту, который дает Render."""
-    port = int(os.getenv("PORT", 8080)) # Render сам передаст порт сюда
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"Web server started on port {port}")
+# ==========================================
+# 👇 ТВОИ КЛЮЧИ (ВНУТРИ КАВЫЧЕК!) 👇
+# ==========================================
 
-# --- РАБОТА С TMDB (ИСТОЧНИК ДАННЫХ) ---
+# Токен от BotFather
+TELEGRAM_TOKEN = "7470711434:AAFfgojLu4NB_Vy42576Bstfajcd66EAHnQ"
 
-async def get_tmdb_data(endpoint, params=None):
-    if not TMDB_API_KEY: return None
-    base_url = "https://api.themoviedb.org/3"
-    default_params = {"api_key": TMDB_API_KEY, "language": "ru-RU"}
-    if params: default_params.update(params)
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"{base_url}{endpoint}", params=default_params) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return None
+# Ключ от Google (AIza...)
+GOOGLE_API_KEY = "AIzaSyDK3QOEnvUFGFL5lAwnvqedGkkRmYHEAn4" 
 
-async def fetch_movie_poster(poster_path):
-    if not poster_path: return None
-    return f"https://image.tmdb.org/t/p/w780{poster_path}"
+# Ключ от TMDB (для постеров)
+TMDB_API_KEY = "efccbf9e43526f8bfe58e1ddb1f65c35" 
+
+# ID твоего канала
+CHANNEL_ID = "@kinoshizik"
+
+# ==========================================
+
+# Настройка Google Gemini
+try:
+    genai.configure(api_key=GOOGLE_API_KEY)
+    # Используем быструю и бесплатную модель Flash
+    model = genai.GenerativeModel('gemini-2.0-flash')
+except Exception as e:
+    print(f"❌ Ошибка настройки Google: {e}")
+    sys.exit()
+
+# Настройка Telegram бота
+try:
+    bot = Bot(token=TELEGRAM_TOKEN)
+    dp = Dispatcher()
+    # Ставим UTC, чтобы Pydroid не ругался на часовые пояса
+    scheduler = AsyncIOScheduler(timezone="UTC")
+except Exception as e:
+    print(f"❌ Ошибка бота: {e}")
+    sys.exit()
 
 # --- БАЗА ДАННЫХ ---
-
 def init_db():
-    conn = sqlite3.connect('bot_memory.db')
+    conn = sqlite3.connect('history.db')
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS history (id TEXT PRIMARY KEY)''')
+    cursor.execute('CREATE TABLE IF NOT EXISTS posted (id TEXT PRIMARY KEY)')
     conn.commit()
     conn.close()
 
-def check_history(item_id):
-    conn = sqlite3.connect('bot_memory.db')
+def is_duplicate(item_id):
+    conn = sqlite3.connect('history.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT id FROM history WHERE id = ?', (str(item_id),))
+    cursor.execute('SELECT id FROM posted WHERE id = ?', (str(item_id),))
     res = cursor.fetchone()
     conn.close()
     return res is not None
 
-def add_to_history(item_id):
-    conn = sqlite3.connect('bot_memory.db')
+def save_to_history(item_id):
+    conn = sqlite3.connect('history.db')
     cursor = conn.cursor()
-    cursor.execute('INSERT OR IGNORE INTO history (id) VALUES (?)', (str(item_id),))
+    cursor.execute('INSERT OR IGNORE INTO posted (id) VALUES (?)', (str(item_id),))
     conn.commit()
     conn.close()
 
-# --- ГЕНЕРАТОРЫ ---
-
-async def create_news_post():
-    category = random.choice(["movie/now_playing", "movie/upcoming", "tv/popular"])
-    data = await get_tmdb_data(f"/{category}")
-    if not data or 'results' not in data: return None, None
-
-    selected_item = None
-    for item in data['results']:
-        item_id = item['id']
-        if not check_history(item_id):
-            selected_item = item
-            add_to_history(item_id)
-            break
-    
-    if not selected_item: return None, None
-
-    title = selected_item.get('title') or selected_item.get('name')
-    overview = selected_item.get('overview', 'Описание отсутствует.')
-    poster_path = selected_item.get('poster_path')
-    release_date = selected_item.get('release_date') or selected_item.get('first_air_date')
-
-    prompt = (
-        f"Ты админ канала 'Киношиза'. Напиши короткий пост (макс 300 знаков) про: {title}.\n"
-        f"Инфо: {overview}. Дата: {release_date}.\n"
-        f"Стиль: Сарказм, молодежный сленг, хайп. Без приветствий."
-    )
+# --- ПОИСК ФИЛЬМОВ (TMDB) ---
+def get_movie_data():
+    """Ищет популярный фильм, которого еще не было в канале."""
+    # Чередуем: Популярное сейчас / Скоро в кино
+    category = random.choice(["movie/now_playing", "movie/popular", "tv/top_rated"])
+    url = f"https://api.themoviedb.org/3/{category}"
+    params = {"api_key": TMDB_API_KEY, "language": "ru-RU", "page": random.randint(1, 5)}
 
     try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.8
-        )
-        text = response.choices[0].message.content
-        image_url = await fetch_movie_poster(poster_path)
-        return text, image_url
+        # Тайм-аут 20 сек, так как мы через VPN
+        response = requests.get(url, params=params, timeout=20)
+        data = response.json()
+        
+        if 'results' in data:
+            for item in data['results']:
+                if not is_duplicate(item['id']):
+                    title = item.get('title') or item.get('name')
+                    overview = item.get('overview', '')
+                    poster = item.get('poster_path')
+                    
+                    if poster: # Берем только если есть постер
+                        return {
+                            'id': item['id'],
+                            'title': title,
+                            'overview': overview,
+                            'poster_url': f"https://image.tmdb.org/t/p/w780{poster}"
+                        }
     except Exception as e:
-        logging.error(f"Error AI: {e}")
-        return None, None
+        logging.error(f"Ошибка TMDB: {e}")
+    return None
 
-async def create_random_fact_post():
-    prompt = "Напиши безумный, короткий факт о кино в стиле 'Киношиза'. 1 предложение."
-    try:
-        text_resp = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}]
+# --- ГЕНЕРАЦИЯ ПОСТА (GOOGLE GEMINI) ---
+async def make_post():
+    logging.info("🚀 (Google) Начинаю создание поста...")
+
+    movie = get_movie_data()
+    
+    if movie:
+        # Если нашли фильм
+        save_to_history(movie['id'])
+        logging.info(f"✅ Фильм найден: {movie['title']}")
+        
+        prompt = (
+            f"Ты безумный админ телеграм-канала 'Киношиза'. "
+            f"Напиши короткий, дерзкий, хайповый пост про фильм '{movie['title']}'. "
+            f"Вот о чем он: {movie['overview']}. "
+            f"Используй сленг, эмодзи 🎬🔥🍿. Не пиши 'Всем привет'. "
+            f"В конце призыва к подписке НЕ делай (я добавлю сам)."
         )
-        text = text_resp.choices[0].message.content
-        img_resp = await client.images.generate(
-            model="dall-e-3",
-            prompt=f"Abstract movie art: {text[:50]}",
-            size="1024x1024"
+        image_url = movie['poster_url']
+    else:
+        # Если фильмы кончились или ошибка сети - генерим факт
+        logging.info("⚠️ Фильм не найден, генерирую факт...")
+        prompt = (
+            "Ты админ канала 'Киношиза'. "
+            "Напиши один короткий, шокирующий факт о кино или актерах. "
+            "Стиль: треш, угар, сленг."
         )
-        return text, img_resp.data[0].url
-    except Exception:
-        return "Киношиза на связи! Смотрите хорошее кино.", None
-
-# --- ЛОГИКА ПУБЛИКАЦИИ ---
-
-async def master_poster():
-    logging.info("Генерация поста...")
-    if not bot: return # Если нет токена, не работаем
+        image_url = None
 
     try:
-        if random.random() < 0.7:
-            caption, image = await create_news_post()
-            if not caption: caption, image = await create_random_fact_post()
-        else:
-            caption, image = await create_random_fact_post()
+        # ЗАПРОС К ГУГЛУ
+        response = await model.generate_content_async(prompt)
+        text = response.text
+        
+        # Формируем пост
+        final_caption = f"{text}\n\n👉 <b>Киношиза подпишись</b>"
 
-        final_caption = f"{caption}\n\n🍿 <b>Киношиза подпишись</b>"
-
-        if image:
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=final_caption, parse_mode="HTML")
+        # Отправляем
+        if image_url:
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=final_caption, parse_mode="HTML")
         else:
             await bot.send_message(chat_id=CHANNEL_ID, text=final_caption, parse_mode="HTML")
-        logging.info("Пост готов!")
+            
+        logging.info("🎉 Пост опубликован успешно!")
+
     except Exception as e:
-        logging.error(f"Ошибка отправки: {e}")
+        logging.error(f"Ошибка Google Gemini или Telegram: {e}")
+        logging.error("Возможно, ты забыл включить VPN или ключ Google неверный.")
 
-# --- ГЛАВНЫЙ ЗАПУСК ---
-
+# --- ЗАПУСК ---
 async def main():
-    if not bot:
-        logging.error("БОТ НЕ ЗАПУЩЕН: НЕТ ТОКЕНА")
-        return
-
     init_db()
     
-    # Запускаем "фейковый" сервер для Render (это решит проблему портов)
-    await start_web_server()
-
-    # Запускаем расписание
-    scheduler.add_job(master_poster, 'interval', minutes=60) # Пост раз в час (для примера)
+    # Расписание: каждые 2 часа
+    scheduler.add_job(make_post, 'interval', hours=2)
     scheduler.start()
     
-    # Запускаем бота
+    print("⏳ Делаю тестовый пост через Google Gemini...")
+    await make_post()
+    
+    print("🤖 Бот запущен! НЕ ВЫКЛЮЧАЙ VPN.")
+    # Удаляем вебхук и запускаем
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот выключен.")
